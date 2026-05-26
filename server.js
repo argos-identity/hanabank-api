@@ -71,13 +71,12 @@ function aes256Encrypt(plaintext, keyBuf = buildEncKey()) {
     return Buffer.concat([salt, iv, ct]).toString('base64');
 }
 
-function pickEnvironment(alias) {
-    const isLive = alias === 'live';
+function pickEnvironment() {
     return {
-        isLive,
-        nameCheckUrl: isLive ? NAMECHECK_URL_LIVE : NAMECHECK_URL_DEV,
-        appKey:       isLive ? APP_KEY_LIVE       : APP_KEY,
-        clntIpAddr:   isLive ? '3.37.80.178'      : '3.35.147.100',
+        isLive: true,
+        nameCheckUrl: NAMECHECK_URL_LIVE,
+        appKey:       APP_KEY_LIVE,
+        clntIpAddr:   '3.37.80.178',
     };
 }
 
@@ -156,12 +155,14 @@ app.get('/health', (req, res) => {
 
 /**
  * POST /nameCheck
- * Body: { bankCode: string, accountNumber: string, alias?: 'live' | 'dev' }
+ * Body: { bankCode: string, accountNumber: string }
  * Response: { accountHolder, resultCode, verification, meta }
+ *
+ * Always calls Hanabank live (production) API.
  */
 app.post('/nameCheck', async (req, res) => {
     console.log('[nameCheck] 요청 수신:', req.body);
-    const { bankCode, accountNumber, alias } = req.body;
+    const { bankCode, accountNumber } = req.body;
 
     if (!bankCode || !accountNumber) {
         return res.status(400).json({
@@ -184,7 +185,7 @@ app.post('/nameCheck', async (req, res) => {
         });
     }
 
-    const env = pickEnvironment(alias);
+    const env = pickEnvironment();
 
     let accessToken;
     try {
