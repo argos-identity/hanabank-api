@@ -1,16 +1,25 @@
 /**
- * Hanabank Proxy Server
+ * Hanabank Proxy Server (Pure Node.js)
  *
- * Architecture: [Client] → [Node :3002] → [Java crypto server :8080] → [Hanabank API]
+ * Implements Hanabank OpenAPI 예금주성명조회 (Account Holder Name Check) per
+ * "[OpenAPI]_개발가이드_은행_예금주성명조회_v1.0" guide.
  *
- * The Java server handles Hanabank SDK calls (token/auth signing/account encryption)
- * because the SDK is closed-source and only provided as a Java implementation.
- * This proxy receives client requests, delegates the 3 crypto steps to the Java
- * server, then calls the Hanabank name-check API.
+ * Crypto spec (from guide):
+ *   - Algorithm: AES-256-CBC with PKCS5/PKCS7 padding
+ *   - Key:       UTF-8 bytes of (ENC_KEY + ENTR_CD + "@@"), must be 32 bytes
+ *   - Output:    Base64( salt(20) ‖ IV(16) ‖ ciphertext )
+ *
+ * Authorization header:
+ *   "bearer " + aes256Encrypt(access_token + ":" + unixTime + ":" + clientId)
+ *   Valid for 15 seconds from unixTime.
+ *
+ * encAccountNo body field:
+ *   aes256Encrypt(accountNumber)
  */
 
 const express = require('express');
 const axios = require('axios');
+const crypto = require('crypto');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 
@@ -19,12 +28,15 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-const JAVA_URL           = process.env.JAVA_URL           || 'http://3.37.80.178:8080';
+const TOKEN_URL          = process.env.TOKEN_URL;
 const NAMECHECK_URL_LIVE = process.env.NAMECHECK_URL_LIVE;
 const NAMECHECK_URL_DEV  = process.env.NAMECHECK_URL_DEV;
+const CLIENT_ID          = process.env.CLIENT_ID;
+const CLIENT_SECRET      = process.env.CLIENT_SECRET;
 const APP_KEY_LIVE       = process.env.APP_KEY_LIVE;
 const APP_KEY            = process.env.APP_KEY;
 const ENTRCD             = process.env.ENTRCD;
+const ENC_KEY            = process.env.ENC_KEY;
 
 const RESULT_MESSAGES = {
     '0000': '조회 성공',
@@ -35,6 +47,29 @@ const RESULT_MESSAGES = {
     '0200': '서비스 일시 중단',
     '9999': '시스템 오류',
 };
+
+function buildEncKey() {
+    const assembled = `${ENC_KEY}${ENTRCD}@@`;
+    const keyBuf = Buffer.from(assembled, 'utf-8');
+    if (keyBuf.length !== 32) {
+        throw new Error(
+            `Assembled encKey must be 32 bytes for AES-256, got ${keyBuf.length} bytes. ` +
+            `(ENC_KEY="${ENC_KEY}" + ENTR_CD="${ENTRCD}" + "@@")`
+        );
+    }
+    return keyBuf;
+}
+
+function aes256Encrypt(plaintext, keyBuf = buildEncKey()) {
+    const salt = crypto.randomBytes(20);
+    const iv   = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv('aes-256-cbc', keyBuf, iv);
+    const ct = Buffer.concat([
+        cipher.update(plaintext, 'utf-8'),
+        cipher.final(),
+    ]);
+    return Buffer.concat([salt, iv, ct]).toString('base64');
+}
 
 function pickEnvironment(alias) {
     const isLive = alias === 'live';
@@ -51,25 +86,26 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(cors({ origin: '*' }));
 
 async function fetchAccessToken() {
-    const { data } = await axios.get(`${JAVA_URL}/gettoken`, { timeout: 10000 });
-    return data;
+    const body = new URLSearchParams({
+        grant_type:    'client_credentials',
+        client_id:     CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+    });
+    const { data } = await axios.post(TOKEN_URL, body.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 10000,
+    });
+    const token = data?.access_token ?? data?.accessToken ?? data;
+    if (!token || typeof token !== 'string') {
+        throw new Error(`Unexpected token response: ${JSON.stringify(data)}`);
+    }
+    return token;
 }
 
-async function generateAuthAndEncryptAccount(accessToken, accountNumber) {
-    const [authRes, encRes] = await Promise.all([
-        axios.post(`${JAVA_URL}/gen-auth`, { token: accessToken }, {
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            timeout: 10000,
-        }),
-        axios.post(`${JAVA_URL}/encrypt-account`, accountNumber, {
-            headers: { 'Content-Type': 'text/plain' },
-            timeout: 10000,
-        }),
-    ]);
-    return {
-        authorization:      authRes.data,
-        encryptedAccountNo: encRes.data,
-    };
+function generateAuthorization(accessToken, keyBuf) {
+    const unixTime = Math.floor(Date.now() / 1000);
+    const stringToken = `${accessToken}:${unixTime}:${CLIENT_ID}`;
+    return `bearer ${aes256Encrypt(stringToken, keyBuf)}`;
 }
 
 function buildNameCheckRequest({ bankCode, encryptedAccountNo, clntIpAddr, isLive }) {
@@ -103,6 +139,21 @@ app.get('/', (req, res) => {
     res.send('Success called (GET)');
 });
 
+app.get('/health', (req, res) => {
+    try {
+        const keyBuf = buildEncKey();
+        res.json({
+            status: 'ok',
+            crypto: 'AES-256-CBC',
+            encKeyLength: keyBuf.length,
+            hasTokenUrl: !!TOKEN_URL,
+            hasClientId: !!CLIENT_ID,
+        });
+    } catch (err) {
+        res.status(500).json({ status: 'error', message: err.message });
+    }
+});
+
 /**
  * POST /nameCheck
  * Body: { bankCode: string, accountNumber: string, alias?: 'live' | 'dev' }
@@ -120,15 +171,28 @@ app.post('/nameCheck', async (req, res) => {
         });
     }
 
+    let keyBuf;
+    try {
+        keyBuf = buildEncKey();
+    } catch (err) {
+        console.error('[nameCheck] encKey 조립 실패:', err.message);
+        return res.status(500).json({
+            error: true,
+            code: 'CONFIG_ERROR',
+            message: err.message,
+            verification: false,
+        });
+    }
+
     const env = pickEnvironment(alias);
 
     let accessToken;
     try {
-        console.log('[nameCheck] Step 1: gettoken');
+        console.log('[nameCheck] Step 1: OAuth token 발급');
         accessToken = await fetchAccessToken();
         console.log('[nameCheck] accessToken:', accessToken);
     } catch (err) {
-        console.error('[nameCheck] gettoken 실패:', err.message);
+        console.error('[nameCheck] token 발급 실패:', err.message);
         return res.status(500).json({
             error: true,
             code: 'TOKEN_FAILED',
@@ -139,16 +203,16 @@ app.post('/nameCheck', async (req, res) => {
 
     let authorization, encryptedAccountNo;
     try {
-        console.log('[nameCheck] Step 2: gen-auth + encrypt-account (병렬)');
-        ({ authorization, encryptedAccountNo } =
-            await generateAuthAndEncryptAccount(accessToken, accountNumber));
+        console.log('[nameCheck] Step 2: Authorization 생성 + 계좌번호 암호화');
+        authorization      = generateAuthorization(accessToken, keyBuf);
+        encryptedAccountNo = aes256Encrypt(accountNumber, keyBuf);
         console.log('[nameCheck] authorization:', authorization);
         console.log('[nameCheck] encryptedAccountNo:', encryptedAccountNo);
     } catch (err) {
-        console.error('[nameCheck] gen-auth/encrypt-account 실패:', err.message);
+        console.error('[nameCheck] 암호화 실패:', err.message);
         return res.status(500).json({
             error: true,
-            code: 'AUTH_FAILED',
+            code: 'ENCRYPT_FAILED',
             message: err.message,
             verification: false,
         });
@@ -203,5 +267,11 @@ app.post('/nameCheck', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Hanabank proxy server running on port ${PORT}`);
+    console.log(`Hanabank proxy server (pure Node.js) running on port ${PORT}`);
+    try {
+        const keyBuf = buildEncKey();
+        console.log(`✓ Crypto ready: AES-256-CBC, encKey ${keyBuf.length} bytes`);
+    } catch (err) {
+        console.error(`✗ Crypto config error: ${err.message}`);
+    }
 });
